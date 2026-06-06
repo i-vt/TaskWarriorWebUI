@@ -1,0 +1,16 @@
+services:
+  taskwarrior-webui:
+    build: .
+    container_name: taskwarrior-webui
+    # Bound to localhost by default. The "Filter" box accepts raw Taskwarrior
+    # expressions, so this is intended as a single-user local tool. To expose
+    # it on your LAN, change the mapping to "62304:62304" (and put it behind
+    # auth / a reverse proxy if it leaves your machine).
+    ports:
+      - "127.0.0.1:62304:62304"
+    volumes:
+      - ./taskdata:/data
+    restart: unless-stopped
+    environment:
+      - TASKDATA=/data/.task
+      - TASKRC=/data/.task/.taskrc
