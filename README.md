@@ -8,6 +8,11 @@ through a single-page UI, while talking to the real `task` binary underneath.
 
 See **[FEATURES.md](FEATURES.md)** for a feature-by-feature coverage matrix.
 
+<img width="2252" height="1776" alt="image" src="https://github.com/user-attachments/assets/fec6b77a-20ab-43e4-8f95-7c2623c18e2c" />
+
+<img width="1277" height="1359" alt="image" src="https://github.com/user-attachments/assets/504849e3-4a31-429f-a080-c357f754c771" />
+
+
 ## Quick Start
 
 ### Docker Compose (recommended)
