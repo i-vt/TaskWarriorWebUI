@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TaskWarrior - Sign in</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#0a0a0c; --surface:#111116; --surface2:#18181f; --border:#2a2a35; --border-bright:#3d3d50;
+    --text:#e2e2f0; --text-dim:#7070a0; --text-muted:#3a3a55; --accent:#f0c040; --accent-dim:#a07a10;
+    --red:#e05050; --radius:4px;
+    --mono:'JetBrains Mono', monospace; --display:'Syne', sans-serif;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body {
+    background:var(--bg); color:var(--text); font-family:var(--mono); font-size:13px;
+    min-height:100vh; min-height:100dvh; display:flex; align-items:center; justify-content:center;
+    padding:20px; overflow-x:hidden;
+  }
+  body::before { content:''; position:fixed; inset:0; pointer-events:none; z-index:9999;
+    background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.07) 2px,rgba(0,0,0,0.07) 4px); }
+
+  .card {
+    width:100%; max-width:380px; background:var(--surface); border:1px solid var(--border);
+    border-radius:var(--radius); padding:32px 28px; display:flex; flex-direction:column; gap:18px;
+  }
+  .logo { font-family:var(--display); font-size:24px; font-weight:800; color:var(--accent);
+    letter-spacing:-0.5px; user-select:none; text-align:center; }
+  .logo span { color:var(--text-dim); font-weight:700; }
+  .tagline { text-align:center; color:var(--text-dim); font-size:11.5px; margin-top:-10px; }
+
+  .field-label { font-size:10px; font-weight:600; letter-spacing:0.15em; color:var(--text-muted);
+    text-transform:uppercase; margin-bottom:6px; display:block; }
+  .key-input {
+    width:100%; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius);
+    color:var(--text); font-family:var(--mono); font-size:14px; padding:11px 12px; outline:none;
+    transition:border-color .15s;
+  }
+  .key-input:focus { border-color:var(--accent-dim); }
+  .key-input::placeholder { color:var(--text-muted); }
+
+  .submit-btn {
+    width:100%; background:var(--accent); border:none; border-radius:var(--radius); color:#0a0a0c;
+    font-family:var(--mono); font-size:13px; font-weight:700; padding:12px; cursor:pointer;
+    transition:background .15s;
+  }
+  .submit-btn:hover { background:#ffd050; }
+  .submit-btn:active { background:var(--accent-dim); }
+
+  .error {
+    display:{% if error %}block{% else %}none{% endif %};
+    background:#2a1214; border:1px solid var(--red); color:var(--red); border-radius:var(--radius);
+    font-size:12px; padding:9px 12px; text-align:center;
+  }
+
+  .hint { color:var(--text-muted); font-size:10.5px; line-height:1.6; text-align:center; }
+  .hint code { color:var(--text-dim); }
+
+  @media (max-width:480px) {
+    body { padding:12px; align-items:flex-start; padding-top:15vh; }
+    .card { padding:24px 18px; }
+    .logo { font-size:21px; }
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="logo">TASK<span>WARRIOR</span></div>
+    <div class="tagline">enter your access key to continue</div>
+
+    <div class="error" id="login-error" role="alert">{{ error or "" }}</div>
+
+    <form method="post" action="{{ url_for('login') }}" autocomplete="off">
+      <label class="field-label" for="key">Access key</label>
+      <input class="key-input" type="password" id="key" name="key"
+             placeholder="32-character key" autofocus required>
+      <div style="height:14px"></div>
+      <button class="submit-btn" type="submit">Sign in</button>
+    </form>
+
+    <div class="hint">
+      retrieve the key from the container with<br>
+      <code>docker exec taskwarrior-webui cat /tmp/TaskWarriorWebUIKey.txt</code>
+    </div>
+  </main>
+</body>
+</html>

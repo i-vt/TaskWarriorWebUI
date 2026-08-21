@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application
 COPY app.py .
 COPY templates/ templates/
+COPY static/ static/
 
 # Data directory for Taskwarrior storage. A bind-mount may shadow this at
 # runtime; the app writes its own .taskrc on startup if one is not present.

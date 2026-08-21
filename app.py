@@ -1,16 +1,29 @@
+import hmac
+import logging
 import os
 import re
 import json
 import shlex
 import subprocess
+import time
+import uuid
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, request, render_template, Response
+from flask import Flask, jsonify, request, render_template, Response, session, redirect, url_for
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 TASK_DATA_DIR = os.environ.get("TASKDATA", "/data/.task")
 TASK_RC = os.environ.get("TASKRC", os.path.join(TASK_DATA_DIR, ".taskrc"))
-os.makedirs(TASK_DATA_DIR, exist_ok=True)
+try:
+    os.makedirs(TASK_DATA_DIR, exist_ok=True)
+except OSError:
+    # Tests and read-only deployments may point TASKDATA somewhere
+    # unwritable; taskwarrior itself will surface any real problem.
+    pass
 
 
 def _ensure_taskrc():
@@ -38,6 +51,142 @@ def _ensure_taskrc():
 
 
 _ensure_taskrc()
+
+
+# --------------------------------------------------------------------------
+# Auth key: one 32-char key shared by every gunicorn worker, persisted to
+# disk so operators can retrieve it from inside the container.
+# --------------------------------------------------------------------------
+
+# Env-overridable so tests and odd deployments can relocate the key file.
+KEY_PATH = os.environ.get("TASKWARRIOR_WEBUI_KEY_PATH",
+                          "/tmp/TaskWarriorWebUIKey.txt")
+
+
+def generate_key():
+    """Return a fresh 32-char lowercase hex key."""
+    return uuid.uuid4().hex
+
+
+def _read_key_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def _log_key_io_error(action, path, exc):
+    # Full diagnostics for operators, but never the key value itself.
+    parent = os.path.dirname(os.path.abspath(path))
+    try:
+        parent_perms = oct(os.stat(parent).st_mode & 0o777)
+    except OSError:
+        parent_perms = "<unavailable>"
+    logger.error(
+        "Failed to %s auth key file (path=%s, errno=%s, error=%s, "
+        "parent dir=%s, parent perms=%s)",
+        action, path, getattr(exc, "errno", None), exc, parent, parent_perms)
+
+
+def _log_key_source(source, path):
+    logger.info("Auth key source: %s (file: %s)", source, path)
+    logger.info("Retrieve the key with: docker exec taskwarrior-webui cat %s",
+                path)
+
+
+def _write_key_file(path, key):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(key + "\n")
+    finally:
+        # Make sure the perms are 0600 even if the file already existed.
+        os.chmod(path, 0o600)
+
+
+def _read_winner_key(path, timeout=5.0, interval=0.1):
+    """Another worker won the O_EXCL race; wait for and read its key."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            existing = _read_key_file(path)
+        except OSError as exc:
+            _log_key_io_error("read", path, exc)
+            raise
+        if len(existing) == 32:
+            _log_key_source("key file created by another worker", path)
+            return existing
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(interval)
+    logger.error(
+        "Key file %s was created by another worker but no 32-char key "
+        "appeared within %.1fs", path, timeout)
+    raise RuntimeError(f"could not read a valid auth key from {path}")
+
+
+def load_or_create_key(path=KEY_PATH):
+    """Return the shared auth key, creating the key file if needed.
+
+    Order of preference:
+    1. TASKWARRIOR_WEBUI_KEY env var (still written to the file).
+    2. An existing key file containing a 32-char key.
+    3. A freshly generated key, written with O_EXCL so concurrent gunicorn
+       workers cannot clobber each other; the loser of the race reads the
+       winner's key.
+
+    A panel without its key file is unusable, so any OSError here is logged
+    with full diagnostics and re-raised.
+    """
+    env_key = os.environ.get("TASKWARRIOR_WEBUI_KEY", "").strip()
+    if env_key:
+        if len(env_key) != 32:
+            logger.warning(
+                "TASKWARRIOR_WEBUI_KEY is %d characters, expected 32; "
+                "accepting it anyway", len(env_key))
+        try:
+            _write_key_file(path, env_key)
+        except OSError as exc:
+            _log_key_io_error("write", path, exc)
+            raise
+        _log_key_source("TASKWARRIOR_WEBUI_KEY env var", path)
+        return env_key
+
+    if os.path.exists(path):
+        try:
+            existing = _read_key_file(path)
+        except OSError as exc:
+            _log_key_io_error("read", path, exc)
+            raise
+        if len(existing) == 32:
+            _log_key_source("reused existing key file", path)
+            return existing
+        logger.warning(
+            "Key file %s does not contain a 32-char key; replacing it", path)
+        try:
+            os.remove(path)
+        except OSError as exc:
+            _log_key_io_error("remove", path, exc)
+            raise
+
+    key = generate_key()
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return _read_winner_key(path)
+    except OSError as exc:
+        _log_key_io_error("create", path, exc)
+        raise
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(key + "\n")
+    except OSError as exc:
+        _log_key_io_error("write", path, exc)
+        raise
+    _log_key_source("generated new key", path)
+    return key
+
+
+AUTH_KEY = load_or_create_key()
+app.secret_key = AUTH_KEY
 
 # Commands that must never be reachable through a user-supplied read filter.
 _BLOCKED_FILTER_TOKENS = {
@@ -164,6 +313,63 @@ def build_set_args(data, *, creating):
             emit(name, "" if value is None else value)
 
     return args
+
+
+# --------------------------------------------------------------------------
+# Authentication
+# --------------------------------------------------------------------------
+def _key_matches(candidate):
+    if not candidate:
+        return False
+    # Encode both sides so non-ASCII input cannot raise inside compare_digest.
+    return hmac.compare_digest(candidate.strip().encode("utf-8"),
+                               AUTH_KEY.encode("utf-8"))
+
+
+def _is_authenticated():
+    if session.get("authenticated") is True:
+        return True
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and _key_matches(auth_header[7:]):
+        return True
+    if _key_matches(request.headers.get("X-Api-Key", "")):
+        return True
+    return False
+
+
+@app.before_request
+def require_auth():
+    # Everything requires auth except the login page, static assets and the
+    # health probe.
+    path = request.path
+    if path == "/login" or path == "/api/healthz" or path.startswith("/static/"):
+        return None
+    if _is_authenticated():
+        return None
+    if path.startswith("/api/"):
+        return jsonify({"error": "Unauthorized"}), 401
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        if request.is_json:
+            submitted = (request.get_json(silent=True) or {}).get("key", "")
+        else:
+            submitted = request.form.get("key", "")
+        if _key_matches(submitted or ""):
+            session["authenticated"] = True
+            return redirect(url_for("index"))
+        logger.warning("Failed login attempt from %s", request.remote_addr)
+        return render_template("login.html", error="Invalid key"), 401
+    return render_template("login.html", error=None)
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 # ──────────────────────────────────────────────────────────────────────────
