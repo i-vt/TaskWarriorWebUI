@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TaskWarrior - Profile</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#0a0a0c; --surface:#111116; --surface2:#18181f; --border:#2a2a35; --border-bright:#3d3d50;
+    --text:#e2e2f0; --text-dim:#7070a0; --text-muted:#3a3a55; --accent:#f0c040; --accent-dim:#a07a10;
+    --red:#e05050; --green:#40c060; --radius:4px;
+    --mono:'JetBrains Mono', monospace; --display:'Syne', sans-serif;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font-family:var(--mono); font-size:13px; min-height:100vh; }
+  body::before { content:''; position:fixed; inset:0; pointer-events:none; z-index:9999;
+    background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.07) 2px,rgba(0,0,0,0.07) 4px); }
+  .wrap { max-width:640px; margin:0 auto; padding:24px 16px 60px; display:flex; flex-direction:column; gap:20px; }
+  .top { display:flex; align-items:center; gap:14px; }
+  .logo { font-family:var(--display); font-size:22px; font-weight:800; color:var(--accent); letter-spacing:-0.5px; }
+  .logo span { color:var(--text-dim); font-weight:700; }
+  .crumb { color:var(--text-muted); font-size:11px; }
+  .spacer { flex:1; }
+  .btn { background:var(--surface2); border:1px solid var(--border); color:var(--text); font-family:var(--mono);
+    font-size:12px; padding:7px 14px; border-radius:var(--radius); cursor:pointer; text-decoration:none;
+    transition:border-color .15s; display:inline-block; }
+  .btn:hover { border-color:var(--accent-dim); }
+  .btn.primary { background:var(--accent); border-color:var(--accent); color:#0a0a0c; font-weight:700; }
+  .btn.primary:hover { background:#ffd050; }
+  .btn.danger { color:var(--red); border-color:#5a2a2a; }
+  .btn.danger:hover { border-color:var(--red); }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px;
+    display:flex; flex-direction:column; gap:14px; }
+  .card h2 { font-family:var(--display); font-size:14px; font-weight:700; }
+  .card .sub { color:var(--text-muted); font-size:11px; line-height:1.6; margin-top:-8px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .row input { flex:1; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius);
+    color:var(--text); font-family:var(--mono); font-size:12px; padding:9px 11px; outline:none; }
+  .row input:focus { border-color:var(--accent-dim); }
+  .pill { display:inline-block; font-size:10px; padding:2px 8px; border-radius:10px; font-weight:600; }
+  .pill.on { background:#12281a; color:var(--green); border:1px solid #1d4430; }
+  .pill.off { background:var(--surface2); color:var(--text-dim); border:1px solid var(--border); }
+  .code { font-size:22px; letter-spacing:0.35em; color:var(--accent); font-weight:700; text-align:center;
+    background:var(--surface2); border:1px dashed var(--border-bright); border-radius:var(--radius); padding:14px; }
+  .toast { position:fixed; bottom:20px; right:20px; background:var(--surface2); border:1px solid var(--green);
+    color:var(--text); padding:10px 16px; border-radius:var(--radius); font-size:12px; z-index:10000; }
+  .toast.error { border-color:var(--red); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="logo">TASK<span>WARRIOR</span></div>
+    <span class="crumb">/ profile · {{ user.username }}</span>
+    <div class="spacer"></div>
+    <a class="btn" href="/">← tasks</a>
+    {% if user.is_admin %}<a class="btn" href="/admin">admin</a>{% endif %}
+    <a class="btn" href="/logout">logout</a>
+  </div>
+
+  <div class="card">
+    <h2>Timezone</h2>
+    <div class="sub">Used by the Telegram bot for reminders, and shown alongside due dates. IANA name, e.g. Europe/Berlin, America/New_York, Asia/Tokyo.</div>
+    <div class="row">
+      <input type="text" id="tz" value="{{ user.timezone or 'UTC' }}" placeholder="Europe/Berlin">
+      <button class="btn primary" id="btn-tz">Save</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Change password</h2>
+    <div class="row"><input type="password" id="oldpw" placeholder="current password"></div>
+    <div class="row"><input type="password" id="newpw" placeholder="new password (min 6 chars)"></div>
+    <div class="row"><button class="btn primary" id="btn-pw">Update password</button></div>
+  </div>
+
+  <div class="card">
+    <h2>Telegram sync</h2>
+    <div class="sub">Link your Telegram account to manage the same tasks from the bot. Open the bot and send <b>/link CODE</b> with the code below. Unlinked Telegram users get their own separate task database.</div>
+    <div>Status: <span id="tg-status" class="pill off">…</span></div>
+    <div class="code" id="tg-code">········</div>
+    <div class="row">
+      <button class="btn primary" id="btn-tgcode">Generate code</button>
+      <button class="btn danger" id="btn-tgunlink" style="display:none">Unlink</button>
+    </div>
+    <div class="sub">Codes expire after 15 minutes and work only once.</div>
+  </div>
+</div>
+
+<script>
+function toast(msg, isErr) {
+  const t = document.createElement('div');
+  t.className = 'toast' + (isErr ? ' error' : '');
+  t.textContent = msg; document.body.appendChild(t);
+  setTimeout(() => t.remove(), 4000);
+}
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: {'Content-Type':'application/json'},
+    body: body ? JSON.stringify(body) : undefined });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { toast(d.error || ('Error ' + r.status), true); throw new Error(d.error); }
+  return d;
+}
+async function refreshTg() {
+  const d = await api('GET', '/api/profile/telegram');
+  const st = document.getElementById('tg-status');
+  st.textContent = d.linked ? 'linked' : 'not linked';
+  st.className = 'pill ' + (d.linked ? 'on' : 'off');
+  document.getElementById('btn-tgunlink').style.display = d.linked ? '' : 'none';
+}
+document.getElementById('btn-tz').addEventListener('click', async () => {
+  const tz = document.getElementById('tz').value.trim();
+  await api('POST', '/api/profile/timezone', { timezone: tz });
+  toast('Timezone saved');
+});
+document.getElementById('btn-pw').addEventListener('click', async () => {
+  await api('POST', '/api/profile/password', {
+    old_password: document.getElementById('oldpw').value,
+    new_password: document.getElementById('newpw').value });
+  document.getElementById('oldpw').value = '';
+  document.getElementById('newpw').value = '';
+  toast('Password updated');
+});
+document.getElementById('btn-tgcode').addEventListener('click', async () => {
+  const d = await api('POST', '/api/profile/telegram/code');
+  document.getElementById('tg-code').textContent = d.code;
+  toast('Code generated — send it to the bot as /link ' + d.code);
+});
+document.getElementById('btn-tgunlink').addEventListener('click', async () => {
+  if (!confirm('Unlink your Telegram account?')) return;
+  await api('POST', '/api/profile/telegram/unlink');
+  toast('Telegram unlinked');
+  refreshTg();
+});
+refreshTg();
+</script>
+</body>
+</html>

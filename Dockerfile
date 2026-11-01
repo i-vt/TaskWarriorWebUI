@@ -6,7 +6,7 @@ FROM python:3.12-slim
 
 # Install Taskwarrior
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends taskwarrior && \
+    apt-get install -y --no-install-recommends taskwarrior curl && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -17,19 +17,20 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application
-COPY app.py .
+COPY app.py bot.py store.py users.py ./
 COPY templates/ templates/
 COPY static/ static/
 
-# Data directory for Taskwarrior storage. A bind-mount may shadow this at
-# runtime; the app writes its own .taskrc on startup if one is not present.
-RUN mkdir -p /data/.task && \
-    printf 'data.location=/data/.task\nconfirmation=no\nverbose=nothing\nrecurrence=on\ngc=on\njson.array=on\n' > /data/.task/.taskrc
+# Data directory: /data/app (users.db, system.log, secret key) and
+# /data/users/u<id> (per-user taskwarrior databases).
+RUN mkdir -p /data/app /data/users
 
 VOLUME ["/data"]
 EXPOSE 62304
 
-ENV TASKDATA=/data/.task \
+ENV TASKWARRIOR_APP_ROOT=/data/app \
+    TASKWARRIOR_USERS_ROOT=/data/users \
+    TASKDATA=/data/.task \
     TASKRC=/data/.task/.taskrc \
     FLASK_ENV=production
 

@@ -36,8 +36,9 @@
   .key-input {
     width:100%; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius);
     color:var(--text); font-family:var(--mono); font-size:14px; padding:11px 12px; outline:none;
-    transition:border-color .15s;
+    transition:border-color .15s; margin-bottom:14px;
   }
+  .key-input:last-child { margin-bottom:0; }
   .key-input:focus { border-color:var(--accent-dim); }
   .key-input::placeholder { color:var(--text-muted); }
 
@@ -68,21 +69,22 @@
 <body>
   <main class="card">
     <div class="logo">TASK<span>WARRIOR</span></div>
-    <div class="tagline">enter your access key to continue</div>
+    <div class="tagline">sign in to your account</div>
 
     <div class="error" id="login-error" role="alert">{{ error or "" }}</div>
 
-    <form method="post" action="{{ url_for('login') }}" autocomplete="off">
-      <label class="field-label" for="key">Access key</label>
-      <input class="key-input" type="password" id="key" name="key"
-             placeholder="32-character key" autofocus required>
+    <form method="post" action="{{ url_for('login') }}{% if request.args.get('next') %}?next={{ request.args.get('next') | urlencode }}{% endif %}" autocomplete="off">
+      <label class="field-label" for="username">Username</label>
+      <input class="key-input" type="text" id="username" name="username" autofocus required>
+      <label class="field-label" for="password">Password</label>
+      <input class="key-input" type="password" id="password" name="password" required>
       <div style="height:14px"></div>
       <button class="submit-btn" type="submit">Sign in</button>
     </form>
 
     <div class="hint">
-      retrieve the key from the container with<br>
-      <code>docker exec taskwarrior-webui cat /tmp/TaskWarriorWebUIKey.txt</code>
+      Accounts are created via registration links.<br>
+      Ask your administrator for one.
     </div>
   </main>
 </body>

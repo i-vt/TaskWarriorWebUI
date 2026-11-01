@@ -1,16 +1,77 @@
 services:
-  taskwarrior-webui:
+  web:
     build: .
     container_name: taskwarrior-webui
-    # Bound to localhost by default. The "Filter" box accepts raw Taskwarrior
-    # expressions, so this is intended as a single-user local tool. To expose
-    # it on your LAN, change the mapping to "62304:62304" (and put it behind
-    # auth / a reverse proxy if it leaves your machine).
+    command: ["gunicorn", "--bind", "0.0.0.0:62304", "--workers",
+              "${WEB_WORKERS:-2}", "--timeout", "30", "app:app"]
     ports:
-      - "127.0.0.1:62304:62304"
+      - "${BIND_ADDR:-0.0.0.0}:${WEB_PORT:-62304}:62304"
     volumes:
-      - ./taskdata:/data
+      - ${DATA_DIR:-./data}:/data
     restart: unless-stopped
     environment:
-      - TASKDATA=/data/.task
-      - TASKRC=/data/.task/.taskrc
+      WEB_PORT: "62304"
+      DOMAIN: ${DOMAIN:-}
+      TIMEZONE: ${TIMEZONE:-UTC}
+      TASKWARRIOR_APP_ROOT: /data/app
+      TASKWARRIOR_USERS_ROOT: /data/users
+      TASKDATA: /data/.task
+      TASKRC: /data/.task/.taskrc
+      TASKWARRIOR_WEBUI_KEY_PATH: /data/app/flask_secret.txt
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:62304/api/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  bot:
+    build: .
+    container_name: taskwarrior-webui-bot
+    command: ["python", "bot.py"]
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_REMINDER_INTERVAL: ${TELEGRAM_REMINDER_INTERVAL:-60}
+      TELEGRAM_DUE_SOON_MINUTES: ${TELEGRAM_DUE_SOON_MINUTES:-60}
+      TASKWARRIOR_APP_ROOT: /data/app
+      TASKWARRIOR_USERS_ROOT: /data/users
+    depends_on:
+      - web
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # HTTPS reverse proxy — only started when a DOMAIN is configured
+  # (install.sh passes --profile https). Serves https://DOMAIN with
+  # automatic Let's Encrypt certificates and proxies to the web container.
+  caddy:
+    image: caddy:2
+    container_name: taskwarrior-webui-caddy
+    profiles: ["https"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    depends_on:
+      - web
+
+volumes:
+  caddy_data:
+  caddy_config:

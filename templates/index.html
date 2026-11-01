@@ -22,6 +22,8 @@
     <button class="icon-btn" id="btn-export" title="Export all tasks as JSON">⬇ export</button>
     <button class="icon-btn" id="btn-import" title="Import tasks from JSON">⬆ import</button>
     <input type="file" id="import-file" accept="application/json,.json" class="hidden">
+    <a class="icon-btn" href="/profile" title="{{ user.username }} · {{ user.timezone }}">⚙ {{ user.username }}</a>
+    {% if user.is_admin %}<a class="icon-btn" href="/admin" title="Admin panel">admin</a>{% endif %}
     <button class="icon-btn" id="btn-logout" title="Log out">⏻ logout</button>
     <button class="btn primary" id="btn-add-top">+ New Task</button>
   </header>

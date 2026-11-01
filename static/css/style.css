@@ -23,6 +23,7 @@
   .stat-pill.active .val { color:var(--green); }
   .icon-btn { background:transparent; border:1px solid var(--border); color:var(--text-dim); border-radius:var(--radius); padding:5px 9px; cursor:pointer; font-family:var(--mono); font-size:12px; transition:all .15s; }
   .icon-btn:hover { border-color:var(--border-bright); color:var(--text); background:var(--surface2); }
+  a.icon-btn { display:inline-block; text-decoration:none; line-height:1.4; }
 
   .sidebar { background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; overflow-y:auto; }
   .sidebar::-webkit-scrollbar { width:4px; } .sidebar::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }

@@ -1,95 +1,70 @@
-import hmac
+"""TaskWarrior WebUI - multi-user web panel with admin management.
+
+Every account gets an isolated Taskwarrior database under
+``/data/users/u<id>/.task``. The first run creates a one-time admin
+registration token; the admin then issues per-member registration links
+from the admin panel. Authentication is session-based (username/password).
+The optional Telegram bot (bot.py) links into the same accounts via
+one-time codes generated on the profile page.
+"""
+import json
 import logging
+import logging.handlers
 import os
 import re
-import json
 import shlex
-import subprocess
+import socket
 import time
-import uuid
+import uuid as uuid_mod
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, request, render_template, Response, session, redirect, url_for
+from functools import wraps
+
+from flask import (Flask, jsonify, request, render_template, Response,
+                   session, redirect, url_for)
+
+import store
+import users
+from users import (KIND_ADMIN_SETUP, KIND_REGISTER, KIND_RESET, KIND_TGLINK)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+APP_ROOT = os.environ.get("TASKWARRIOR_APP_ROOT", "/data/app")
+SYSTEM_LOG = os.path.join(APP_ROOT, "system.log")
+os.makedirs(APP_ROOT, exist_ok=True)
+try:
+    _file_handler = logging.handlers.RotatingFileHandler(
+        SYSTEM_LOG, maxBytes=2_000_000, backupCount=3)
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(_file_handler)
+except OSError as exc:  # read-only FS in some tests
+    logger.warning("Could not open system log %s: %s", SYSTEM_LOG, exc)
+
 app = Flask(__name__)
 
-TASK_DATA_DIR = os.environ.get("TASKDATA", "/data/.task")
-TASK_RC = os.environ.get("TASKRC", os.path.join(TASK_DATA_DIR, ".taskrc"))
-try:
-    os.makedirs(TASK_DATA_DIR, exist_ok=True)
-except OSError:
-    # Tests and read-only deployments may point TASKDATA somewhere
-    # unwritable; taskwarrior itself will surface any real problem.
-    pass
-
-
-def _ensure_taskrc():
-    """Write a sane default config if none exists.
-
-    A runtime bind-mount can shadow any config baked into the image, so the
-    container must be able to create its own .taskrc on first start. We still
-    pass rc.* flags per-invocation, but a real file avoids first-run prompts
-    and lets recurrence generation happen on reads.
-    """
-    if os.path.exists(TASK_RC):
-        return
-    try:
-        with open(TASK_RC, "w") as f:
-            f.write(
-                f"data.location={TASK_DATA_DIR}\n"
-                "confirmation=no\n"
-                "verbose=nothing\n"
-                "recurrence=on\n"
-                "gc=on\n"
-                "json.array=on\n"
-            )
-    except OSError:
-        pass
-
-
-_ensure_taskrc()
-
+WEB_PORT = os.environ.get("WEB_PORT", "62304")
+DOMAIN = os.environ.get("DOMAIN", "").strip()
+DEFAULT_TIMEZONE = os.environ.get("TIMEZONE", "UTC")
 
 # --------------------------------------------------------------------------
-# Auth key: one 32-char key shared by every gunicorn worker, persisted to
-# disk so operators can retrieve it from inside the container.
+# Flask secret key: one 32-char key shared by every gunicorn worker,
+# persisted to disk so sessions survive restarts. Env-overridable so tests
+# and odd deployments can relocate the key file.
 # --------------------------------------------------------------------------
-
-# Env-overridable so tests and odd deployments can relocate the key file.
 KEY_PATH = os.environ.get("TASKWARRIOR_WEBUI_KEY_PATH",
-                          "/tmp/TaskWarriorWebUIKey.txt")
+                          os.path.join(APP_ROOT, "flask_secret.txt"))
 
 
 def generate_key():
     """Return a fresh 32-char lowercase hex key."""
-    return uuid.uuid4().hex
+    return uuid_mod.uuid4().hex
 
 
 def _read_key_file(path):
     with open(path, "r", encoding="utf-8") as f:
         return f.read().strip()
-
-
-def _log_key_io_error(action, path, exc):
-    # Full diagnostics for operators, but never the key value itself.
-    parent = os.path.dirname(os.path.abspath(path))
-    try:
-        parent_perms = oct(os.stat(parent).st_mode & 0o777)
-    except OSError:
-        parent_perms = "<unavailable>"
-    logger.error(
-        "Failed to %s auth key file (path=%s, errno=%s, error=%s, "
-        "parent dir=%s, parent perms=%s)",
-        action, path, getattr(exc, "errno", None), exc, parent, parent_perms)
-
-
-def _log_key_source(source, path):
-    logger.info("Auth key source: %s (file: %s)", source, path)
-    logger.info("Retrieve the key with: docker exec taskwarrior-webui cat %s",
-                path)
 
 
 def _write_key_file(path, key):
@@ -98,7 +73,6 @@ def _write_key_file(path, key):
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(key + "\n")
     finally:
-        # Make sure the perms are 0600 even if the file already existed.
         os.chmod(path, 0o600)
 
 
@@ -106,245 +80,187 @@ def _read_winner_key(path, timeout=5.0, interval=0.1):
     """Another worker won the O_EXCL race; wait for and read its key."""
     deadline = time.monotonic() + timeout
     while True:
-        try:
-            existing = _read_key_file(path)
-        except OSError as exc:
-            _log_key_io_error("read", path, exc)
-            raise
+        existing = _read_key_file(path)
         if len(existing) == 32:
-            _log_key_source("key file created by another worker", path)
             return existing
         if time.monotonic() >= deadline:
             break
         time.sleep(interval)
-    logger.error(
-        "Key file %s was created by another worker but no 32-char key "
-        "appeared within %.1fs", path, timeout)
-    raise RuntimeError(f"could not read a valid auth key from {path}")
+    raise RuntimeError(f"could not read a valid secret key from {path}")
 
 
 def load_or_create_key(path=KEY_PATH):
-    """Return the shared auth key, creating the key file if needed.
-
-    Order of preference:
-    1. TASKWARRIOR_WEBUI_KEY env var (still written to the file).
-    2. An existing key file containing a 32-char key.
-    3. A freshly generated key, written with O_EXCL so concurrent gunicorn
-       workers cannot clobber each other; the loser of the race reads the
-       winner's key.
-
-    A panel without its key file is unusable, so any OSError here is logged
-    with full diagnostics and re-raised.
-    """
     env_key = os.environ.get("TASKWARRIOR_WEBUI_KEY", "").strip()
     if env_key:
-        if len(env_key) != 32:
-            logger.warning(
-                "TASKWARRIOR_WEBUI_KEY is %d characters, expected 32; "
-                "accepting it anyway", len(env_key))
-        try:
-            _write_key_file(path, env_key)
-        except OSError as exc:
-            _log_key_io_error("write", path, exc)
-            raise
-        _log_key_source("TASKWARRIOR_WEBUI_KEY env var", path)
+        _write_key_file(path, env_key)
         return env_key
-
     if os.path.exists(path):
-        try:
-            existing = _read_key_file(path)
-        except OSError as exc:
-            _log_key_io_error("read", path, exc)
-            raise
+        existing = _read_key_file(path)
         if len(existing) == 32:
-            _log_key_source("reused existing key file", path)
             return existing
-        logger.warning(
-            "Key file %s does not contain a 32-char key; replacing it", path)
-        try:
-            os.remove(path)
-        except OSError as exc:
-            _log_key_io_error("remove", path, exc)
-            raise
-
+        os.remove(path)
     key = generate_key()
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         return _read_winner_key(path)
-    except OSError as exc:
-        _log_key_io_error("create", path, exc)
-        raise
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(key + "\n")
-    except OSError as exc:
-        _log_key_io_error("write", path, exc)
-        raise
-    _log_key_source("generated new key", path)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(key + "\n")
     return key
 
 
-AUTH_KEY = load_or_create_key()
-app.secret_key = AUTH_KEY
+app.secret_key = load_or_create_key()
 
-# Commands that must never be reachable through a user-supplied read filter.
-_BLOCKED_FILTER_TOKENS = {
-    "add", "modify", "delete", "done", "start", "stop", "purge", "undo",
-    "edit", "import", "export", "log", "duplicate", "annotate", "denotate",
-    "append", "prepend", "config", "execute", "context", "synchronize",
-    "sync", "merge", "push", "pull", "import", "diagnostics",
-}
+# --------------------------------------------------------------------------
+# Networking helpers for registration/reset links
+# --------------------------------------------------------------------------
+_public_ip_cache = None
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Low level taskwarrior invocation
-# ──────────────────────────────────────────────────────────────────────────
-def run_task(*args, input_data=None):
-    env = os.environ.copy()
-    env["TASKDATA"] = TASK_DATA_DIR
-    env["TASKRC"] = TASK_RC
-    cmd = ["task"] + [str(a) for a in args]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, env=env, input=input_data
-    )
-    return result.stdout, result.stderr, result.returncode
+def public_ip(timeout=3.0):
+    global _public_ip_cache
+    if _public_ip_cache is not None:
+        return _public_ip_cache or None
+    try:
+        import urllib.request
+        with urllib.request.urlopen("https://api.ipify.org",
+                                    timeout=timeout) as r:
+            _public_ip_cache = r.read().decode("utf-8", "replace").strip()
+    except Exception as exc:
+        logger.info("Public IP detection failed: %s", exc)
+        _public_ip_cache = ""
+    return _public_ip_cache or None
 
 
-# Common rc flags injected on every call so behaviour is deterministic.
-RC = ["rc.json.array=on", "rc.verbose=nothing", "rc.confirmation=no",
-      "rc.recurrence=on", "rc.hooks=off"]
+def enumerate_ipv4():
+    """All local IPv4 addresses (plus localhost) for admin setup links."""
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                       socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))  # no traffic is actually sent
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    ips.add("127.0.0.1")
+    return sorted(ips)
+
+
+def external_base_url():
+    """Base URL for links handed to users (public IP preferred)."""
+    if DOMAIN:
+        return f"https://{DOMAIN}"
+    host = public_ip() or "127.0.0.1"
+    return f"http://{host}:{WEB_PORT}"
+
+
+# --------------------------------------------------------------------------
+# Per-user task environment
+# --------------------------------------------------------------------------
+def current_task_env():
+    uid = session.get("user_id")
+    if uid:
+        d = store.user_data_dir(uid)
+        return d, os.path.join(d, ".taskrc")
+    return store.DEFAULT_TASKDATA, store.DEFAULT_TASKRC
+
+
+def ensure_user_taskenv(user_id):
+    d = store.user_data_dir(user_id)
+    store.ensure_taskrc(d)
+    return d
+
+
+# Compatibility wrappers (also used by the test-suite).
+def run_task(*args, input_data=None, **kwargs):
+    data_dir, rc_path = current_task_env()
+    return store.run_task(*args, data_dir=data_dir, rc_path=rc_path,
+                          input_data=input_data, **kwargs)
 
 
 def export(filter_tokens=None):
-    """Return a list of task dicts for the given filter."""
-    args = list(RC)
-    if filter_tokens:
-        args += list(filter_tokens)
-    args.append("export")
-    out, err, code = run_task(*args)
-    out = out.strip()
-    if not out:
-        return []
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError:
-        return []
+    data_dir, rc_path = current_task_env()
+    return store.export(filter_tokens, data_dir=data_dir, rc_path=rc_path)
 
 
 def sanitize_filter(raw):
-    """Split a raw taskwarrior filter string into safe argv tokens.
-
-    Strips anything that could turn a read into a mutating command or
-    override our rc flags. This is defence-in-depth: the UI is intended to
-    bind to localhost, but a stray report filter should never delete data.
-    """
-    if not raw:
-        return []
-    try:
-        tokens = shlex.split(raw)
-    except ValueError:
-        tokens = raw.split()
-    safe = []
-    for t in tokens:
-        low = t.lower()
-        if low in _BLOCKED_FILTER_TOKENS:
-            continue
-        if low.startswith("rc.") or low.startswith("rc:"):
-            continue
-        safe.append(t)
-    return safe
+    return store.sanitize_filter(raw)
 
 
 def latest():
-    """The most recently added/modified task (uses the +LATEST virtual tag)."""
-    tasks = export(["+LATEST"])
-    return tasks[0] if tasks else None
+    data_dir, rc_path = current_task_env()
+    return store.latest(data_dir=data_dir, rc_path=rc_path)
 
 
-def uuid_filter(uuid):
-    # Always address tasks by uuid so the reference survives status changes
-    # (deleted tasks lose their short id, which breaks numeric filters).
-    return [f"uuid:{uuid}"]
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Argument builders shared by add / modify
-# ──────────────────────────────────────────────────────────────────────────
-_DATE_ATTRS = ("due", "scheduled", "wait", "until")
-_KNOWN_ATTRS = {"description", "project", "priority", "recur"} | set(_DATE_ATTRS)
+def uuid_filter(u):
+    return store.uuid_filter(u)
 
 
 def build_set_args(data, *, creating):
-    """Build `name:value` modifier tokens from a payload dict.
+    return store.build_set_args(data, creating=creating)
 
-    `creating` distinguishes `add` (only emit keys that are present and
-    truthy) from `modify` (emit a key whenever it is present, allowing
-    `""` to clear an attribute).
-    """
-    args = []
 
-    def emit(key, value):
-        if value is None:
-            return
-        value = str(value).strip()
-        if creating and value == "":
-            return
-        args.append(f"{key}:{value}")
+def _parse_tw_date(s):
+    return store.parse_tw_date(s)
 
-    if creating:
-        for k in ("project", "priority", "recur", *_DATE_ATTRS):
-            if data.get(k):
-                emit(k, data[k])
-    else:
-        for k in ("project", "priority", "recur", *_DATE_ATTRS):
-            if k in data:
-                emit(k, data[k])
 
-    # User Defined Attributes (arbitrary name:value pairs)
-    udas = data.get("uda") or {}
-    if isinstance(udas, dict):
-        for name, value in udas.items():
-            name = re.sub(r"[^A-Za-z0-9_]", "", str(name))
-            if not name:
-                continue
-            if creating and (value is None or str(value).strip() == ""):
-                continue
-            emit(name, "" if value is None else value)
-
-    return args
+def _now_iso_compact():
+    return store.now_iso_compact()
 
 
 # --------------------------------------------------------------------------
-# Authentication
+# Auth
 # --------------------------------------------------------------------------
-def _key_matches(candidate):
-    if not candidate:
-        return False
-    # Encode both sides so non-ASCII input cannot raise inside compare_digest.
-    return hmac.compare_digest(candidate.strip().encode("utf-8"),
-                               AUTH_KEY.encode("utf-8"))
+def current_user():
+    uid = session.get("user_id")
+    if not uid:
+        return None
+    u = users.get_user(uid)
+    if not u or u["disabled"]:
+        session.clear()
+        return None
+    return u
 
 
-def _is_authenticated():
-    if session.get("authenticated") is True:
-        return True
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer ") and _key_matches(auth_header[7:]):
-        return True
-    if _key_matches(request.headers.get("X-Api-Key", "")):
-        return True
-    return False
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not current_user():
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Unauthorized"}), 401
+            return redirect(url_for("login", next=request.path))
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        u = current_user()
+        if not u:
+            return jsonify({"error": "Unauthorized"}), 401
+        if not u["is_admin"]:
+            return jsonify({"error": "Admin only"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
 
 
 @app.before_request
 def require_auth():
-    # Everything requires auth except the login page, static assets and the
-    # health probe.
     path = request.path
-    if path == "/login" or path == "/api/healthz" or path.startswith("/static/"):
+    public = (path == "/login" or path == "/api/healthz"
+              or path.startswith("/static/")
+              or path.startswith("/register/")
+              or path.startswith("/reset/"))
+    if public:
         return None
-    if _is_authenticated():
+    if current_user():
         return None
     if path.startswith("/api/"):
         return jsonify({"error": "Unauthorized"}), 401
@@ -354,36 +270,146 @@ def require_auth():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        if request.is_json:
-            submitted = (request.get_json(silent=True) or {}).get("key", "")
-        else:
-            submitted = request.form.get("key", "")
-        if _key_matches(submitted or ""):
-            session["authenticated"] = True
-            return redirect(url_for("index"))
-        logger.warning("Failed login attempt from %s", request.remote_addr)
-        return render_template("login.html", error="Invalid key"), 401
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        result = users.verify_login(username, password)
+        if result == "disabled":
+            logger.warning("Disabled login attempt for %r from %s",
+                           username, request.remote_addr)
+            return render_template("login.html",
+                                   error="This account is disabled"), 403
+        if result:
+            session.clear()
+            session["user_id"] = result["id"]
+            session.permanent = True
+            ensure_user_taskenv(result["id"])
+            logger.info("User '%s' logged in from %s",
+                        result["username"], request.remote_addr)
+            nxt = request.args.get("next") or url_for("index")
+            if not nxt.startswith("/"):
+                nxt = url_for("index")
+            return redirect(nxt)
+        logger.warning("Failed login attempt for %r from %s",
+                       username, request.remote_addr)
+        return render_template("login.html", error="Invalid credentials"), 401
     return render_template("login.html", error=None)
 
 
 @app.route("/logout", methods=["GET", "POST"])
 def logout():
+    u = current_user()
+    if u:
+        logger.info("User '%s' logged out", u["username"])
     session.clear()
     return redirect(url_for("login"))
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Page
-# ──────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
+# Registration & password reset (token-based)
+# --------------------------------------------------------------------------
+@app.route("/register/<token>", methods=["GET", "POST"])
+def register(token):
+    row = users.peek_token(token)
+    if not row or row["kind"] not in (KIND_ADMIN_SETUP, KIND_REGISTER):
+        return render_template("message.html",
+                               title="Invalid link",
+                               message="This registration link is invalid, "
+                                       "already used, or has expired."), 400
+    if row["kind"] == KIND_ADMIN_SETUP and users.admin_exists():
+        return render_template("message.html",
+                               title="Admin exists",
+                               message="An admin account already exists."), 400
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        confirm = request.form.get("confirm", "")
+        if password != confirm:
+            return render_template("register.html", token=token,
+                                   is_admin=row["kind"] == KIND_ADMIN_SETUP,
+                                   error="Passwords do not match"), 400
+        try:
+            user_id = users.create_user(
+                username, password,
+                is_admin=(row["kind"] == KIND_ADMIN_SETUP),
+                timezone=DEFAULT_TIMEZONE)
+        except ValueError as exc:
+            return render_template("register.html", token=token,
+                                   is_admin=row["kind"] == KIND_ADMIN_SETUP,
+                                   error=str(exc)), 400
+        users.consume_token(token, row["kind"])
+        ensure_user_taskenv(user_id)
+        if row["kind"] == KIND_ADMIN_SETUP:
+            logger.info("SYSTEM: admin account '%s' created via one-time "
+                        "registration link (token used)", username)
+        else:
+            logger.info("SYSTEM: member account '%s' registered via invite "
+                        "link", username)
+        session.clear()
+        session["user_id"] = user_id
+        return redirect(url_for("index"))
+    return render_template("register.html", token=token, error=None,
+                           is_admin=row["kind"] == KIND_ADMIN_SETUP)
+
+
+@app.route("/reset/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    row = users.peek_token(token, KIND_RESET)
+    if not row:
+        return render_template("message.html",
+                               title="Invalid link",
+                               message="This password reset link is invalid, "
+                                       "already used, or has expired."), 400
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        confirm = request.form.get("confirm", "")
+        if password != confirm:
+            return render_template("reset.html", token=token,
+                                   error="Passwords do not match"), 400
+        try:
+            users.set_password(row["user_id"], password)
+        except ValueError as exc:
+            return render_template("reset.html", token=token,
+                                   error=str(exc)), 400
+        users.consume_token(token, KIND_RESET)
+        u = users.get_user(row["user_id"])
+        logger.info("SYSTEM: password reset completed for user '%s'",
+                    u["username"] if u else row["user_id"])
+        return render_template("message.html",
+                               title="Password updated",
+                               message="Your password has been updated. "
+                                       "You can sign in now.")
+    return render_template("reset.html", token=token, error=None)
+
+
+# --------------------------------------------------------------------------
+# Pages
+# --------------------------------------------------------------------------
 @app.route("/")
+@login_required
 def index():
-    return render_template("index.html")
+    return render_template("index.html", user=current_user())
+
+
+@app.route("/admin")
+@login_required
+def admin_page():
+    u = current_user()
+    if not u["is_admin"]:
+        return redirect(url_for("index"))
+    return render_template("admin.html", user=u)
+
+
+@app.route("/profile")
+@login_required
+def profile_page():
+    return render_template("profile.html", user=current_user())
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Task collection
+# Task collection (scoped to the signed-in user's database)
 # ──────────────────────────────────────────────────────────────────────────
 @app.route("/api/tasks", methods=["GET"])
+@login_required
 def list_tasks():
     status = request.args.get("status", "")
     vtag = request.args.get("vtag", "")          # virtual tag, e.g. OVERDUE
@@ -425,50 +451,25 @@ def list_tasks():
 
 
 @app.route("/api/tasks", methods=["POST"])
+@login_required
 def add_task():
     data = request.json or {}
-    description = (data.get("description") or "").strip()
-    if not description:
-        return jsonify({"error": "Description required"}), 400
-
-    args = list(RC) + ["add"]
-    args += build_set_args(data, creating=True)
-
-    for t in data.get("tags", []) or []:
-        t = str(t).strip()
-        if t:
-            args.append(f"+{t}")
-
-    deps = [d for d in (data.get("depends") or []) if str(d).strip()]
-    if deps:
-        args.append("depends:" + ",".join(str(d).strip() for d in deps))
-
-    args.append(description)
-    out, err, code = run_task(*args)
-    if code != 0:
-        return jsonify({"error": err.strip() or out.strip()}), 500
-
-    created = latest()
-
-    # Annotations cannot be supplied to `add`; attach them to the new task.
-    annos = [a for a in (data.get("annotations") or []) if str(a).strip()]
-    if created and annos:
-        for a in annos:
-            run_task(*RC, f"uuid:{created['uuid']}", "annotate", str(a))
-        created = export(uuid_filter(created["uuid"]))
-        created = created[0] if created else None
-
+    created, err = store.add_task(data, *current_task_env())
+    if err:
+        status = 400 if "Description" in err else 500
+        return jsonify({"error": err}), status
     return jsonify(created or {"message": "added"}), 201
 
 
 @app.route("/api/tasks/log", methods=["POST"])
+@login_required
 def log_task():
     """Record an already-completed task (taskwarrior `log`)."""
     data = request.json or {}
     description = (data.get("description") or "").strip()
     if not description:
         return jsonify({"error": "Description required"}), 400
-    args = list(RC) + ["log"]
+    args = list(store.RC) + ["log"]
     args += build_set_args(data, creating=True)
     for t in data.get("tags", []) or []:
         t = str(t).strip()
@@ -485,13 +486,13 @@ def log_task():
 # Single task
 # ──────────────────────────────────────────────────────────────────────────
 @app.route("/api/tasks/<uuid>", methods=["GET"])
+@login_required
 def get_task(uuid):
     tasks = export(uuid_filter(uuid))
     if not tasks:
         return jsonify({"error": "Not found"}), 404
     task = tasks[0]
 
-    # Resolve dependency uuids to lightweight {uuid, id, description, status}.
     dep_uuids = task.get("depends") or []
     if isinstance(dep_uuids, str):
         dep_uuids = [d for d in dep_uuids.split(",") if d]
@@ -512,9 +513,10 @@ def get_task(uuid):
 
 
 @app.route("/api/tasks/<uuid>", methods=["PATCH"])
+@login_required
 def modify_task(uuid):
     data = request.json or {}
-    args = list(RC) + uuid_filter(uuid) + ["modify"]
+    args = list(store.RC) + uuid_filter(uuid) + ["modify"]
 
     if "description" in data and str(data["description"]).strip():
         args.append(str(data["description"]).strip())
@@ -550,59 +552,66 @@ def modify_task(uuid):
 
 
 def _simple_action(uuid, verb, ok_msg):
-    out, err, code = run_task(*RC, *uuid_filter(uuid), verb)
+    out, err, code = run_task(*store.RC, *uuid_filter(uuid), verb)
     if code != 0:
         return jsonify({"error": err.strip() or out.strip()}), 500
     return jsonify({"message": ok_msg})
 
 
 @app.route("/api/tasks/<uuid>/done", methods=["POST"])
+@login_required
 def complete_task(uuid):
     return _simple_action(uuid, "done", "Task completed")
 
 
 @app.route("/api/tasks/<uuid>/start", methods=["POST"])
+@login_required
 def start_task(uuid):
     return _simple_action(uuid, "start", "Task started")
 
 
 @app.route("/api/tasks/<uuid>/stop", methods=["POST"])
+@login_required
 def stop_task(uuid):
     return _simple_action(uuid, "stop", "Task stopped")
 
 
 @app.route("/api/tasks/<uuid>", methods=["DELETE"])
+@login_required
 def delete_task(uuid):
     return _simple_action(uuid, "delete", "Task deleted")
 
 
 @app.route("/api/tasks/<uuid>/purge", methods=["POST"])
+@login_required
 def purge_task(uuid):
     """Permanently remove a task. Taskwarrior only allows purging a task
     that is already deleted, and only when addressed by uuid."""
     tasks = export(uuid_filter(uuid))
     if tasks and tasks[0].get("status") != "deleted":
-        run_task(*RC, *uuid_filter(uuid), "delete")
-    out, err, code = run_task(*RC, *uuid_filter(uuid), "purge")
+        run_task(*store.RC, *uuid_filter(uuid), "delete")
+    out, err, code = run_task(*store.RC, *uuid_filter(uuid), "purge")
     if code != 0:
         return jsonify({"error": err.strip() or out.strip()}), 500
     return jsonify({"message": "Task purged"})
 
 
 @app.route("/api/tasks/<uuid>/duplicate", methods=["POST"])
+@login_required
 def duplicate_task(uuid):
-    out, err, code = run_task(*RC, *uuid_filter(uuid), "duplicate")
+    out, err, code = run_task(*store.RC, *uuid_filter(uuid), "duplicate")
     if code != 0:
         return jsonify({"error": err.strip() or out.strip()}), 500
     return jsonify(latest() or {"message": "duplicated"}), 201
 
 
 @app.route("/api/tasks/<uuid>/annotate", methods=["POST"])
+@login_required
 def annotate_task(uuid):
     text = (request.json or {}).get("text", "").strip()
     if not text:
         return jsonify({"error": "Annotation text required"}), 400
-    out, err, code = run_task(*RC, *uuid_filter(uuid), "annotate", text)
+    out, err, code = run_task(*store.RC, *uuid_filter(uuid), "annotate", text)
     if code != 0:
         return jsonify({"error": err.strip() or out.strip()}), 500
     task = export(uuid_filter(uuid))
@@ -610,11 +619,12 @@ def annotate_task(uuid):
 
 
 @app.route("/api/tasks/<uuid>/denotate", methods=["POST"])
+@login_required
 def denotate_task(uuid):
     text = (request.json or {}).get("text", "").strip()
     if not text:
         return jsonify({"error": "Annotation text required"}), 400
-    out, err, code = run_task(*RC, *uuid_filter(uuid), "denotate", text)
+    out, err, code = run_task(*store.RC, *uuid_filter(uuid), "denotate", text)
     if code != 0:
         return jsonify({"error": err.strip() or out.strip()}), 500
     task = export(uuid_filter(uuid))
@@ -625,6 +635,7 @@ def denotate_task(uuid):
 # Global operations
 # ──────────────────────────────────────────────────────────────────────────
 @app.route("/api/undo", methods=["POST"])
+@login_required
 def undo():
     out, err, code = run_task("rc.confirmation=no", "rc.verbose=nothing", "undo")
     if code != 0:
@@ -633,6 +644,7 @@ def undo():
 
 
 @app.route("/api/export", methods=["GET"])
+@login_required
 def export_all():
     out, err, code = run_task("rc.json.array=on", "rc.verbose=nothing", "export")
     return Response(
@@ -643,6 +655,7 @@ def export_all():
 
 
 @app.route("/api/import", methods=["POST"])
+@login_required
 def import_tasks():
     payload = None
     if request.files.get("file"):
@@ -663,20 +676,17 @@ def import_tasks():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Metadata: projects, tags, stats, udas, contexts, reports
+# Metadata: projects, tags, stats, udas, contexts
 # ──────────────────────────────────────────────────────────────────────────
-def _now_iso_compact():
-    # Taskwarrior stores dates as YYYYMMDDTHHMMSSZ (no separators).
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
 @app.route("/api/projects", methods=["GET"])
+@login_required
 def list_projects():
     out, _, _ = run_task("rc.verbose=nothing", "_projects")
     return jsonify([p.strip() for p in out.splitlines() if p.strip()])
 
 
 @app.route("/api/tags", methods=["GET"])
+@login_required
 def list_tags():
     out, _, _ = run_task("rc.verbose=nothing", "_tags")
     skip = {"next", "nocolor", "nocal", "nonag"}
@@ -685,6 +695,7 @@ def list_tags():
 
 
 @app.route("/api/stats", methods=["GET"])
+@login_required
 def get_stats():
     pending = export(["status:pending"])
     now = _now_iso_compact()
@@ -704,6 +715,7 @@ def get_stats():
 
 
 @app.route("/api/overview", methods=["GET"])
+@login_required
 def overview():
     """One round-trip powering the sidebar + stat bar."""
     pending = export(["status:pending"])
@@ -760,18 +772,16 @@ def overview():
 def _read_priorities():
     out, _, _ = run_task("rc.verbose=nothing", "_get", "rc.uda.priority.values")
     vals = [v for v in out.strip().split(",")]
-    # Keep "" (no priority) handling on the client; expose only real values.
     return [v for v in vals if v]
 
 
 def _read_udas():
-    """Discover configured UDAs (name, label, type, allowed values)."""
     out, _, _ = run_task("rc.verbose=nothing", "_udas")
     names = [n.strip() for n in out.splitlines() if n.strip()]
     udas = []
     for name in names:
         if name == "priority":
-            continue  # built-in, surfaced as its own control
+            continue
         label, _, _ = run_task("rc.verbose=nothing", "_get", f"rc.uda.{name}.label")
         typ, _, _ = run_task("rc.verbose=nothing", "_get", f"rc.uda.{name}.type")
         values, _, _ = run_task("rc.verbose=nothing", "_get", f"rc.uda.{name}.values")
@@ -798,16 +808,19 @@ def _read_contexts():
 
 
 @app.route("/api/udas", methods=["GET"])
+@login_required
 def get_udas():
     return jsonify(_read_udas())
 
 
 @app.route("/api/contexts", methods=["GET"])
+@login_required
 def get_contexts():
     return jsonify(_read_contexts())
 
 
 @app.route("/api/contexts", methods=["POST"])
+@login_required
 def define_context():
     data = request.json or {}
     name = re.sub(r"[^A-Za-z0-9_]", "", data.get("name", ""))
@@ -823,6 +836,7 @@ def define_context():
 
 
 @app.route("/api/contexts/<name>", methods=["DELETE"])
+@login_required
 def delete_context(name):
     name = re.sub(r"[^A-Za-z0-9_]", "", name)
     out, err, code = run_task("rc.verbose=nothing", "rc.confirmation=no",
@@ -833,6 +847,7 @@ def delete_context(name):
 
 
 @app.route("/api/context", methods=["POST"])
+@login_required
 def set_context():
     name = (request.json or {}).get("name", "").strip()
     if not name or name.lower() == "none":
@@ -849,8 +864,8 @@ def set_context():
 # Reports / insights
 # ──────────────────────────────────────────────────────────────────────────
 @app.route("/api/reports/summary", methods=["GET"])
+@login_required
 def report_summary():
-    """Per-project progress (pending vs completed)."""
     rows = {}
     for t in export(["status:pending"]):
         p = t.get("project") or "(none)"
@@ -867,18 +882,9 @@ def report_summary():
     return jsonify(out)
 
 
-def _parse_tw_date(s):
-    if not s:
-        return None
-    try:
-        return datetime.strptime(s, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-
-
 @app.route("/api/reports/burndown", methods=["GET"])
+@login_required
 def report_burndown():
-    """Daily added vs completed counts over the last N days."""
     days = max(7, min(180, int(request.args.get("days", 30))))
     today = datetime.now(timezone.utc).date()
     start = today - timedelta(days=days - 1)
@@ -886,7 +892,7 @@ def report_burndown():
     added = {start + timedelta(days=i): 0 for i in range(days)}
     completed = dict(added)
 
-    for t in export([]):  # everything
+    for t in export([]):
         e = _parse_tw_date(t.get("entry"))
         if e and start <= e.date() <= today:
             added[e.date()] += 1
@@ -902,11 +908,199 @@ def report_burndown():
     return jsonify(series)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Profile (current user): timezone, password, Telegram sync
+# ──────────────────────────────────────────────────────────────────────────
+@app.route("/api/me", methods=["GET"])
+@login_required
+def me():
+    u = current_user()
+    return jsonify({
+        "id": u["id"], "username": u["username"], "is_admin": bool(u["is_admin"]),
+        "timezone": u["timezone"], "reminders": bool(u["reminders"]),
+        "telegram_linked": u["telegram_id"] is not None,
+    })
+
+
+@app.route("/api/profile/timezone", methods=["POST"])
+@login_required
+def profile_timezone():
+    tz = (request.json or {}).get("timezone", "").strip()
+    try:
+        users.set_timezone(current_user()["id"], tz)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    logger.info("User '%s' set timezone to %s", current_user()["username"], tz)
+    return jsonify({"message": "Timezone updated", "timezone": tz})
+
+
+@app.route("/api/profile/password", methods=["POST"])
+@login_required
+def profile_password():
+    data = request.json or {}
+    old, new = data.get("old_password", ""), data.get("new_password", "")
+    u = current_user()
+    if not users._verify_password(old, u["password_hash"]):
+        return jsonify({"error": "Current password is incorrect"}), 403
+    try:
+        users.set_password(u["id"], new)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    logger.info("User '%s' changed their password", u["username"])
+    return jsonify({"message": "Password updated"})
+
+
+@app.route("/api/profile/telegram", methods=["GET"])
+@login_required
+def telegram_status():
+    u = current_user()
+    return jsonify({
+        "linked": u["telegram_id"] is not None,
+        "telegram_id": u["telegram_id"],
+    })
+
+
+@app.route("/api/profile/telegram/code", methods=["POST"])
+@login_required
+def telegram_code():
+    code = users.create_short_code(KIND_TGLINK, user_id=current_user()["id"])
+    logger.info("User '%s' generated a Telegram link code",
+                current_user()["username"])
+    return jsonify({"code": code, "ttl_seconds": users._TTL[KIND_TGLINK]})
+
+
+@app.route("/api/profile/telegram/unlink", methods=["POST"])
+@login_required
+def telegram_unlink():
+    users.unlink_telegram(current_user()["id"])
+    logger.info("User '%s' unlinked their Telegram account",
+                current_user()["username"])
+    return jsonify({"message": "Telegram account unlinked"})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Admin APIs
+# ──────────────────────────────────────────────────────────────────────────
+@app.route("/api/admin/users", methods=["GET"])
+@admin_required
+def admin_users():
+    return jsonify(users.list_users())
+
+
+@app.route("/api/admin/users/<int:user_id>/disable", methods=["POST"])
+@admin_required
+def admin_disable(user_id):
+    target = users.get_user(user_id)
+    if not target:
+        return jsonify({"error": "User not found"}), 404
+    if target["id"] == current_user()["id"]:
+        return jsonify({"error": "You cannot disable yourself"}), 400
+    if target["is_admin"]:
+        return jsonify({"error": "You cannot disable an admin"}), 400
+    users.set_disabled(user_id, True)
+    logger.info("SYSTEM: admin '%s' disabled user '%s'",
+                current_user()["username"], target["username"])
+    return jsonify({"message": f"User '{target['username']}' disabled"})
+
+
+@app.route("/api/admin/users/<int:user_id>/enable", methods=["POST"])
+@admin_required
+def admin_enable(user_id):
+    target = users.get_user(user_id)
+    if not target:
+        return jsonify({"error": "User not found"}), 404
+    users.set_disabled(user_id, False)
+    logger.info("SYSTEM: admin '%s' enabled user '%s'",
+                current_user()["username"], target["username"])
+    return jsonify({"message": f"User '{target['username']}' enabled"})
+
+
+@app.route("/api/admin/users/<int:user_id>/reset", methods=["POST"])
+@admin_required
+def admin_reset(user_id):
+    target = users.get_user(user_id)
+    if not target:
+        return jsonify({"error": "User not found"}), 404
+    token = users.create_token(KIND_RESET, user_id=user_id,
+                               created_by=current_user()["id"])
+    link = f"{external_base_url()}/reset/{token}"
+    logger.info("SYSTEM: admin '%s' created a password reset link for user "
+                "'%s'", current_user()["username"], target["username"])
+    return jsonify({"link": link, "username": target["username"]})
+
+
+@app.route("/api/admin/users/<int:user_id>", methods=["DELETE"])
+@admin_required
+def admin_delete(user_id):
+    target = users.get_user(user_id)
+    if not target:
+        return jsonify({"error": "User not found"}), 404
+    if target["id"] == current_user()["id"]:
+        return jsonify({"error": "You cannot delete yourself"}), 400
+    if target["is_admin"]:
+        return jsonify({"error": "You cannot delete an admin"}), 400
+    import shutil
+    users.delete_user(user_id)
+    shutil.rmtree(store.user_data_dir(user_id), ignore_errors=True)
+    logger.info("SYSTEM: admin '%s' deleted user '%s' and all their data",
+                current_user()["username"], target["username"])
+    return jsonify({"message": f"User '{target['username']}' and all their "
+                               "data were deleted"})
+
+
+@app.route("/api/admin/register-link", methods=["POST"])
+@admin_required
+def admin_register_link():
+    token = users.create_token(KIND_REGISTER, created_by=current_user()["id"])
+    link = f"{external_base_url()}/register/{token}"
+    logger.info("SYSTEM: admin '%s' generated a member registration link",
+                current_user()["username"])
+    return jsonify({"link": link, "expires_in_days": 7})
+
+
+@app.route("/api/admin/logs", methods=["GET"])
+@admin_required
+def admin_logs():
+    lines = max(10, min(1000, int(request.args.get("lines", 200))))
+    try:
+        with open(SYSTEM_LOG, "r", encoding="utf-8", errors="replace") as f:
+            content = f.readlines()[-lines:]
+    except OSError:
+        content = []
+    return jsonify({"lines": "".join(content).splitlines()})
+
+
 @app.route("/api/healthz")
 def healthz():
-    _, _, code = run_task("rc.verbose=nothing", "_version")
+    _, _, code = store.run_task("rc.verbose=nothing", "_version")
     return jsonify({"ok": code == 0})
 
 
+# --------------------------------------------------------------------------
+# Startup: create the one-time admin registration token when no admin exists
+# and log a registration link for every enumerated IP address.
+# --------------------------------------------------------------------------
+def bootstrap_admin_token():
+    users.init_db()
+    users.cleanup_tokens()
+    if users.admin_exists():
+        return
+    token = users.create_token(KIND_ADMIN_SETUP)
+    logger.info("=" * 64)
+    logger.info("SYSTEM: no admin account exists yet.")
+    logger.info("SYSTEM: a one-time admin registration token was created "
+                "(valid 24h, single use).")
+    if DOMAIN:
+        logger.info("SYSTEM: admin registration link: https://%s/register/%s",
+                    DOMAIN, token)
+    for ip in enumerate_ipv4():
+        logger.info("SYSTEM: admin registration link via %s: "
+                    "http://%s:%s/register/%s", ip, ip, WEB_PORT, token)
+    logger.info("=" * 64)
+
+
+bootstrap_admin_token()
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=62304, debug=False)
+    app.run(host="0.0.0.0", port=int(WEB_PORT), debug=False)
